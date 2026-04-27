@@ -1,0 +1,1107 @@
+'use client';
+
+import { useState, useEffect, useRef } from 'react';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import * as z from 'zod';
+import * as Dialog from '@radix-ui/react-dialog';
+import { Upload, X, Search, Crop } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import Image from 'next/image';
+import DragDropUpload from './DragDropUpload';
+import ImageCropper from './ImageCropper';
+import { MapComponent } from './MapComponent';
+
+const colorSubmissionSchema = z.object({
+  name: z.string().min(1, 'Color name is required'),
+  description: z.string().min(1, 'Description is required').max(1000, 'Description must be less than 1000 characters'),
+  location: z.string().min(1, 'Location is required'),
+  coordinates: z.object({
+    lat: z.number(),
+    lng: z.number(),
+  }).optional(),
+  sourceMaterial: z.string().min(1, 'Source material is required'),
+  type: z.enum(['pigment', 'dye', 'ink']),
+  application: z.string().optional(),
+  process: z.string().min(1, 'Process description is required').max(5000, 'Process description must be less than 5000 characters'),
+  season: z.string().min(1, 'Season is required'),
+  dateCollected: z.string().refine((date) => {
+    const d = new Date(date);
+    return !isNaN(d.getTime());
+  }, "Please enter a valid date"),
+  authorName: z.string().optional(),
+  email: z.string().min(1, 'Email is required').refine((email) => {
+    // Simple email validation - just check for @ and .
+    return email.includes('@') && email.includes('.') && email.length > 5;
+  }, 'Please enter a valid email address'),
+  agreeToTerms: z.boolean().optional(),
+  hex: z.string().min(1, 'Hex color is required'),
+  mediaUploads: z.array(z.any()).optional(),
+});
+
+export type ColorSubmissionForm = z.infer<typeof colorSubmissionSchema> & {
+  mediaFiles?: MediaFile[];
+};
+export { colorSubmissionSchema };
+
+interface ColorSubmissionFormProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSubmit: (data: ColorSubmissionForm) => Promise<void>;
+}
+
+interface LocationSuggestion {
+  display_name: string;
+  lat: string;
+  lon: string;
+}
+
+interface MediaFile {
+  file: File;
+  type: 'outcome' | 'landscape' | 'process' | 'outcome_original';
+  preview: string;
+  caption: string;
+}
+
+interface ProcessImage {
+  file: File;
+  preview: string;
+  caption: string;
+}
+
+
+
+export default function ColorSubmissionForm({ isOpen, onClose, onSubmit }: ColorSubmissionFormProps) {
+  const router = useRouter();
+  const [mediaFiles, setMediaFiles] = useState<MediaFile[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [locationSuggestions, setLocationSuggestions] = useState<LocationSuggestion[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [searchTimeout, setSearchTimeout] = useState<NodeJS.Timeout | null>(null);
+  const suggestionsRef = useRef<HTMLDivElement>(null);
+  const [processImages, setProcessImages] = useState<ProcessImage[]>([]);
+  const [currentCaption, setCurrentCaption] = useState('');
+  const [showCropper, setShowCropper] = useState(false);
+  const [cropperImage, setCropperImage] = useState<string>('');
+  const [cropperType, setCropperType] = useState<'outcome' | 'landscape'>('outcome');
+  const [mapCoordinates, setMapCoordinates] = useState<{ lat: number; lng: number } | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'idle' | 'detecting' | 'success' | 'error'>('idle');
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+    setValue,
+    watch,
+    reset,
+  } = useForm<ColorSubmissionForm>({
+    resolver: zodResolver(colorSubmissionSchema),
+    defaultValues: {
+      type: 'pigment',
+      season: 'Spring',
+      coordinates: { lat: 0, lng: 0 },
+      hex: '#000000',
+    }
+  });
+
+  useEffect(() => {
+    if (isOpen) {
+      setMediaFiles([]);
+      
+      // Try to get user's current location automatically
+      getUserLocation().then((locationFound) => {
+        if (!locationFound) {
+          // Fallback to default coordinates if location detection fails
+          const coords = watch('coordinates');
+          if (!coords || !coords.lat || !coords.lng) {
+            const defaultCoords = { lat: 40.7128, lng: -74.0060 }; // New York as default center
+            setMapCoordinates(defaultCoords);
+            setValue('coordinates', defaultCoords);
+          } else {
+            setMapCoordinates(coords);
+          }
+        }
+      });
+    }
+  }, [isOpen]);
+
+  // Keep mapCoordinates in sync with form coordinates
+  useEffect(() => {
+    const coords = watch('coordinates');
+    if (coords && coords.lat && coords.lng) {
+      setMapCoordinates(coords);
+    }
+  }, [watch('coordinates')]);
+
+  const searchLocation = async (query: string) => {
+    if (query.length < 3) {
+      setLocationSuggestions([]);
+      setShowSuggestions(false);
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=5`
+      );
+      const data = await response.json();
+      setLocationSuggestions(data);
+      setShowSuggestions(true);
+    } catch (error) {
+      console.error('Error fetching location suggestions:', error);
+    }
+  };
+
+  const handleLocationInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const query = e.target.value;
+    setValue('location', query);
+
+    if (searchTimeout) {
+      clearTimeout(searchTimeout);
+    }
+
+    const timeout = setTimeout(() => {
+      searchLocation(query);
+    }, 300);
+
+    setSearchTimeout(timeout);
+  };
+
+  // Get user's current location automatically
+  const getUserLocation = async () => {
+    console.log('🔄 Attempting to get user location...');
+    setLocationStatus('detecting');
+    
+    if (!navigator.geolocation) {
+      console.log('❌ Geolocation not supported, using default coordinates');
+      setLocationStatus('error');
+      return false;
+    }
+
+    try {
+      console.log('📍 Requesting location permission...');
+      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 60000
+        });
+      });
+
+      const { latitude, longitude } = position.coords;
+      console.log('✅ Location obtained:', { latitude, longitude });
+      
+      try {
+        // Reverse geocode to get location name
+        console.log('🌍 Reverse geocoding location...');
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=10`
+        );
+        const data = await response.json();
+        
+        const locationName = data.display_name || `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+        console.log('📍 Location name:', locationName);
+        
+        setValue('location', locationName);
+        setValue('coordinates', { lat: latitude, lng: longitude });
+        setMapCoordinates({ lat: latitude, lng: longitude });
+        setLocationStatus('success');
+        console.log('✅ Location set successfully!');
+        return true;
+              } catch (error) {
+          console.error('❌ Error getting location name:', error);
+          // Fallback to coordinates if reverse geocoding fails
+          const fallbackName = `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+          console.log('📍 Using fallback location name:', fallbackName);
+          setValue('location', fallbackName);
+          setValue('coordinates', { lat: latitude, lng: longitude });
+          setMapCoordinates({ lat: latitude, lng: longitude });
+          setLocationStatus('success');
+          return true;
+        }
+      } catch (error: any) {
+        console.error('❌ Error getting location:', error);
+        if (error.code) {
+          switch (error.code) {
+            case error.PERMISSION_DENIED:
+              console.error('🚫 Location permission denied by user');
+              break;
+            case error.POSITION_UNAVAILABLE:
+              console.error('❓ Location information unavailable');
+              break;
+            case error.TIMEOUT:
+              console.error('⏰ Location request timed out');
+              break;
+            default:
+              console.error('❓ Unknown location error:', error.code);
+          }
+        }
+        setLocationStatus('error');
+        return false;
+      }
+    };
+
+  // When user picks a location from suggestions, update mapCoordinates
+  const handleSuggestionClick = (suggestion: LocationSuggestion) => {
+    const lat = parseFloat(suggestion.lat);
+    const lng = parseFloat(suggestion.lon);
+    setValue('location', suggestion.display_name);
+    setValue('coordinates', { lat, lng });
+    setMapCoordinates({ lat, lng });
+    setShowSuggestions(false);
+  };
+
+  // Handler for clicking on the map
+  const handleMapClick = ({ latLng }: { latLng: [number, number] }) => {
+    const [lat, lng] = latLng;
+    setMapCoordinates({ lat, lng });
+    setValue('coordinates', { lat, lng });
+  };
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (suggestionsRef.current && !suggestionsRef.current.contains(event.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
+  // Helper function to compress images
+  const compressImage = (file: File, maxWidth: number = 1024, maxHeight: number = 1024, quality: number = 0.8): Promise<File> => {
+    return new Promise((resolve) => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const img = document.createElement('img');
+      
+      img.onload = () => {
+        // Calculate new dimensions
+        let { width, height } = img;
+        
+        if (width > height) {
+          if (width > maxWidth) {
+            height = (height * maxWidth) / width;
+            width = maxWidth;
+          }
+        } else {
+          if (height > maxHeight) {
+            width = (width * maxHeight) / height;
+            height = maxHeight;
+          }
+        }
+        
+        canvas.width = width;
+        canvas.height = height;
+        
+        // Draw and compress
+        ctx?.drawImage(img, 0, 0, width, height);
+        
+        canvas.toBlob((blob) => {
+          if (blob) {
+            const compressedFile = new File([blob], file.name, {
+              type: 'image/jpeg',
+              lastModified: Date.now(),
+            });
+            resolve(compressedFile);
+          } else {
+            resolve(file); // Fallback to original file
+          }
+        }, 'image/jpeg', quality);
+      };
+      
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
+  const handleFileUpload = async (files: File[], type: 'outcome' | 'landscape' | 'process') => {
+    console.log('File upload triggered for type:', type);
+    console.log('Files selected:', files?.length);
+    
+    if (!files || files.length === 0) return;
+
+    // Handle multiple files for process type
+    if (type === 'process') {
+      console.log('Processing multiple files for process type');
+      
+      // Check if we're adding too many files
+      const currentProcessFiles = mediaFiles.filter(m => m.type === 'process').length;
+      const newFilesCount = files.length;
+      const totalFiles = currentProcessFiles + newFilesCount;
+      
+      console.log('Current process files:', currentProcessFiles);
+      console.log('New files to add:', newFilesCount);
+      console.log('Total files after addition:', totalFiles);
+      
+      if (totalFiles > 20) {
+        alert('You can only upload up to 20 media photos. Please remove some files first.');
+        return;
+      }
+      
+      // Process files sequentially to avoid memory issues
+      for (const file of files) {
+        console.log(`Processing file:`, file.name, file.size);
+        
+        // Compress the image first
+        const compressedFile = await compressImage(file, 1024, 1024, 0.8);
+        console.log(`Compressed file size:`, compressedFile.size);
+        
+        const preview = URL.createObjectURL(compressedFile);
+        const newMedia: MediaFile = {
+          file: compressedFile,
+          type,
+          preview,
+          caption: '',
+        };
+        setMediaFiles(prev => {
+          const newFiles = [...prev, newMedia];
+          console.log('Updated media files count:', newFiles.length);
+          return newFiles;
+        });
+      }
+    } else {
+      // For outcome and landscape, only handle one file
+      const file = files[0];
+      console.log('Processing single file:', file.name, file.size);
+      
+      // Compress the image first
+      const compressedFile = await compressImage(file, 1024, 1024, 0.8);
+      console.log(`Compressed file size:`, compressedFile.size);
+      
+      const preview = URL.createObjectURL(compressedFile);
+
+      // If it's an outcome image, generate hex code
+      if (type === 'outcome') {
+        console.log('Generating hex for outcome image...');
+        const hex = await getAverageColor(compressedFile);
+        console.log('Generated hex:', hex);
+        setValue('hex', hex); // Set the hex value in the form
+        console.log('Hex value set in form');
+        const newMedia: MediaFile = {
+          file: compressedFile,
+          type,
+          preview,
+          caption: hex,
+        };
+        // Remove any existing outcome image
+        setMediaFiles(prev => [...prev.filter(m => m.type !== 'outcome'), newMedia]);
+      } else {
+        const newMedia: MediaFile = {
+          file: compressedFile,
+          type,
+          preview,
+          caption: '',
+        };
+        // Remove any existing landscape image
+        setMediaFiles(prev => [...prev.filter(m => m.type !== 'landscape'), newMedia]);
+      }
+    }
+  };
+
+  const getAverageColor = async (file: File): Promise<string> => {
+    console.log('getAverageColor called with file:', file.name);
+    return new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        console.log('File read successfully');
+        const img = document.createElement('img');
+        img.onload = () => {
+          console.log('Image loaded, dimensions:', img.width, 'x', img.height);
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            console.log('No canvas context, using default hex');
+            resolve('#000000');
+            return;
+          }
+
+          // Set canvas size to match image
+          canvas.width = img.width;
+          canvas.height = img.height;
+
+          // Draw image on canvas
+          ctx.drawImage(img, 0, 0);
+
+          // Get image data
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const data = imageData.data;
+
+          let r = 0, g = 0, b = 0;
+          const pixelCount = data.length / 4;
+
+          // Sum up all RGB values
+          for (let i = 0; i < data.length; i += 4) {
+            r += data[i];
+            g += data[i + 1];
+            b += data[i + 2];
+          }
+
+          // Calculate average
+          r = Math.round(r / pixelCount);
+          g = Math.round(g / pixelCount);
+          b = Math.round(b / pixelCount);
+
+          // Convert to hex
+          const hex = '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase();
+          console.log('Calculated hex:', hex, 'from RGB:', r, g, b);
+          resolve(hex);
+        };
+        img.src = e.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleRemoveFile = (index: number) => {
+    const fileToRemove = mediaFiles[index];
+    console.log('Removing file:', fileToRemove);
+    
+    // If removing outcome image, clear the hex value
+    if (fileToRemove.type === 'outcome') {
+      console.log('Removing outcome image, clearing hex value');
+      setValue('hex', '');
+    }
+    
+    setMediaFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleCaptionChange = (index: number, caption: string) => {
+    setMediaFiles(prev => {
+      const newFiles = [...prev];
+      newFiles[index] = { ...newFiles[index], caption };
+      return newFiles;
+    });
+  };
+
+  const handleCropImage = (type: 'outcome' | 'landscape') => {
+    const existingFile = mediaFiles.find(m => m.type === type);
+    if (existingFile) {
+      setCropperImage(existingFile.preview);
+      setCropperType(type);
+      setShowCropper(true);
+    }
+  };
+
+  const handleCropComplete = async (croppedFile: File) => {
+    const preview = URL.createObjectURL(croppedFile);
+    
+    if (cropperType === 'outcome') {
+      const hex = await getAverageColor(croppedFile);
+      setValue('hex', hex);
+      // Find the original file (from mediaFiles before cropping)
+      const originalMedia = mediaFiles.find(m => m.type === 'outcome');
+      // Save the original (uncropped) image as a separate media entry
+      if (originalMedia) {
+        const originalMediaEntry: MediaFile = {
+          file: originalMedia.file,
+          type: 'outcome_original',
+          preview: originalMedia.preview,
+          caption: '',
+        };
+        setMediaFiles(prev => [
+          ...prev.filter(m => m.type !== 'outcome' && m.type !== 'outcome_original'),
+          originalMediaEntry,
+          {
+        file: croppedFile,
+        type: 'outcome',
+        preview,
+        caption: hex,
+          }
+        ]);
+      } else {
+        // Fallback: just save the cropped image
+        setMediaFiles(prev => [
+          ...prev.filter(m => m.type !== 'outcome'),
+          {
+            file: croppedFile,
+            type: 'outcome',
+            preview,
+            caption: hex,
+          }
+        ]);
+      }
+    } else {
+      const newMedia: MediaFile = {
+        file: croppedFile,
+        type: 'landscape',
+        preview,
+        caption: '',
+      };
+      setMediaFiles(prev => [...prev.filter(m => m.type !== 'landscape'), newMedia]);
+    }
+    
+    setShowCropper(false);
+    setCropperImage('');
+  };
+
+  const handleCropCancel = () => {
+    setShowCropper(false);
+    setCropperImage('');
+  };
+
+  const handleProcessImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const preview = URL.createObjectURL(file);
+    setProcessImages(prev => [...prev, { file, preview, caption: '' }]);
+  };
+
+  const handleProcessImageCaptionChange = (index: number, caption: string) => {
+    setProcessImages(prev => prev.map((img, i) => 
+      i === index ? { ...img, caption } : img
+    ));
+  };
+
+  const handleRemoveProcessImage = (index: number) => {
+    setProcessImages(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const handleFormSubmit = async (data: ColorSubmissionForm) => {
+    console.log('🎯 handleFormSubmit FUNCTION CALLED!');
+    console.log('=== FORM SUBMISSION STARTED ===');
+    console.log('Form submission started with data:', data);
+    console.log('Media files count:', mediaFiles.length);
+    console.log('Form errors:', errors);
+    console.log('Form is valid:', Object.keys(errors).length === 0);
+    console.log('Email field value:', data.email);
+    console.log('Email field type:', typeof data.email);
+    console.log('Coordinates value:', data.coordinates);
+    console.log('Hex value:', data.hex);
+    console.log('All form data:', data);
+    console.log('=== FORM SUBMISSION DATA END ===');
+    
+    // Check if form has validation errors
+    if (Object.keys(errors).length > 0) {
+      console.error('Form has validation errors:', errors);
+      alert('Please fix the form errors before submitting.');
+      return;
+    }
+    
+    // Check if outcome photo is uploaded
+    const outcomePhoto = mediaFiles.find(m => m.type === 'outcome');
+    if (!outcomePhoto) {
+      alert('Please upload an outcome photo. This is required to generate the hex color code.');
+      return;
+    }
+    
+    // Check if all required fields are present
+    const requiredFields = ['name', 'description', 'location', 'sourceMaterial', 'process', 'season', 'dateCollected', 'email', 'hex'];
+    const missingFields = requiredFields.filter(field => !data[field as keyof ColorSubmissionForm]);
+    
+    if (missingFields.length > 0) {
+      console.error('Missing required fields:', missingFields);
+      alert(`Please fill in all required fields: ${missingFields.join(', ')}`);
+      return;
+    }
+    
+    // Check if coordinates are set
+    if (!data.coordinates || (data.coordinates.lat === 0 && data.coordinates.lng === 0)) {
+      console.warn('No coordinates selected, using default');
+    }
+    
+    setSubmitting(true);
+    try {
+      // Set default coordinates if not selected
+      if (!data.coordinates) {
+        data.coordinates = { lat: 0, lng: 0 };
+      }
+
+      // Set a default hex color if not set
+      if (!data.hex) {
+        data.hex = '#000000';
+      }
+
+      // Format the date properly
+      const formattedDate = new Date(data.dateCollected).toISOString();
+      
+      // Prepare the color data with media files
+      const colorData = {
+        ...data,
+        dateCollected: formattedDate,
+        mediaFiles: mediaFiles, // Include media files for parent to handle
+      };
+
+      console.log('Prepared color data:', colorData);
+
+      // Call the parent's onSubmit handler
+      await onSubmit(colorData);
+      
+      // Reset form state
+      reset();
+      setMediaFiles([]);
+      
+      onClose();
+    } catch (error) {
+      console.error('Error submitting form:', error);
+      alert('Failed to submit form. Please try again.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog.Root open={isOpen} onOpenChange={() => {}}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100]" />
+        <Dialog.Content className="fixed left-[50%] top-[50%] max-h-[85vh] w-[90vw] max-w-[800px] translate-x-[-50%] translate-y-[-50%] rounded-lg bg-white p-6 shadow-lg overflow-y-auto border-2 border-black z-[110] flex flex-col">
+          <div className="flex items-center justify-between mb-6">
+            <Dialog.Title className="text-2xl font-bold text-[#2C3E50]" style={{ fontFamily: '"Futura Magazine", monospace' }}>
+              Add New Color
+            </Dialog.Title>
+            <Dialog.Close asChild>
+              <button className="rounded-full p-1.5 hover:bg-black/5" onClick={onClose}>
+                <X className="h-5 w-5 text-[#2C3E50]" />
+              </button>
+            </Dialog.Close>
+          </div>
+          <form 
+            onSubmit={handleSubmit(handleFormSubmit, (errors) => {
+              console.error('Form validation failed:', errors);
+              alert('Please fix the form errors before submitting.');
+            })} 
+            className="flex flex-col flex-1"
+            onChange={() => {
+              console.log('Form changed, errors:', errors);
+              console.log('Form values:', watch());
+            }}
+            onInvalid={(e) => {
+              console.log('Form invalid event triggered:', e);
+            }}
+          >
+            <div className="flex-1 overflow-y-auto space-y-6">
+            {/* Basic Information */}
+            <div className="space-y-4">
+              <div>
+                <label className="block font-mono text-sm text-[#2C3E50] mb-2">
+                  Color Name
+                </label>
+                <input
+                  {...register('name')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                  placeholder="Enter the name you would give to this color"
+                />
+                {errors.name && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.name.message}</p>
+                )}
+              </div>
+
+              <div>
+                <label className="block font-mono text-sm text-[#2C3E50] mb-2">
+                  Landscape Description
+                </label>
+                <textarea
+                  {...register('description')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none min-h-[100px]"
+                  placeholder="Describe the landscape where the material comes from"
+                  rows={4}
+                  maxLength={1000}
+                />
+                <div className="flex justify-between items-center mt-1">
+                  {errors.description && (
+                    <p className="text-red-500 text-xs">{errors.description.message}</p>
+                  )}
+                  <p className="text-xs text-gray-500 font-mono ml-auto">
+                    {watch('description')?.length || 0}/1000 characters
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-mono text-sm text-[#2C3E50] mb-2">
+                  Source Material
+                </label>
+                <input
+                  {...register('sourceMaterial')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                  placeholder="Enter the source material that originated this color"
+                />
+                {errors.sourceMaterial && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.sourceMaterial.message}</p>
+                )}
+              </div>
+
+              <div className="relative">
+                <label className="block font-mono text-sm text-[#2C3E50] mb-2">
+                  Location
+                </label>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-[#2C3E50] w-4 h-4" />
+                  <input
+                    {...register('location')}
+                    onChange={handleLocationInput}
+                    className="w-full pl-10 pr-4 py-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                    placeholder="Search for a location..."
+                  />
+                </div>
+
+                {/* Location Status Indicator */}
+                {locationStatus === 'detecting' && (
+                  <div className="mt-2 flex items-center gap-2 text-xs text-blue-600">
+                    <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-blue-600"></div>
+                    Detecting your location...
+                  </div>
+                )}
+                {locationStatus === 'success' && (
+                  <div className="mt-2 flex items-center gap-2 text-xs text-green-600">
+                    ✓ Location detected successfully
+                  </div>
+                )}
+                {locationStatus === 'error' && (
+                  <div className="mt-2 flex items-center gap-2 text-xs text-red-600">
+                    ⚠️ Could not detect location. Please insert complete address or map coordinates.
+                  </div>
+                )}
+                {errors.location && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.location.message}</p>
+                )}
+                {/* Location suggestions dropdown */}
+                {showSuggestions && locationSuggestions.length > 0 && (
+                  <div
+                    ref={suggestionsRef}
+                    className="absolute z-50 w-full mt-1 bg-white border-2 border-[#2C3E50] max-h-60 overflow-auto shadow-lg"
+                  >
+                    {locationSuggestions.map((suggestion, index) => (
+                      <button
+                        key={index}
+                        type="button"
+                        className="w-full p-2 text-left hover:bg-gray-100 font-mono text-sm"
+                        onClick={() => handleSuggestionClick(suggestion)}
+                      >
+                        {suggestion.display_name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {/* Map for location selection */}
+                <div className="mt-4 h-[300px] border-2 border-[#2C3E50] rounded-lg overflow-hidden">
+                  {mapCoordinates && (
+                    <MapComponent
+                      coordinates={mapCoordinates}
+                      onClick={handleMapClick}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* Move Type field here, after Location */}
+              <div>
+                <label className="block font-mono text-sm text-[#2C3E50] mb-2">
+                  Type
+                </label>
+                <select
+                  {...register('type')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                >
+                  <option value="pigment">Pigment</option>
+                  <option value="dye">Dye</option>
+                  <option value="ink">Ink</option>
+                </select>
+                {errors.type && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.type.message}</p>
+                )}
+              </div>
+
+              {/* Process Description - Required field */}
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Process Description</label>
+                <textarea
+                  {...register('process')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none min-h-[100px]"
+                  placeholder="Describe the process used to create this color"
+                  rows={4}
+                  maxLength={5000}
+                />
+                <div className="flex justify-between items-center mt-1">
+                  {errors.process && (
+                    <p className="text-red-500 text-xs">{errors.process.message}</p>
+                  )}
+                  <p className="text-xs text-gray-500 font-mono ml-auto">
+                    {watch('process')?.length || 0}/5000 characters
+                  </p>
+                </div>
+              </div>
+
+              {/* Application (optional) before Season */}
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Application (optional):</label>
+                <input
+                  {...register('application')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                />
+              </div>
+
+              {/* Season before Email */}
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Season:</label>
+                <select
+                  {...register('season')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                >
+                  <option value="Spring">Spring</option>
+                  <option value="Summer">Summer</option>
+                  <option value="Autumn">Autumn</option>
+                  <option value="Winter">Winter</option>
+                </select>
+              </div>
+
+              {/* Email after Season */}
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Email</label>
+                <input
+                  {...register('email')}
+                  type="email"
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                  placeholder="Enter your email"
+                />
+                {errors.email && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.email.message}</p>
+                )}
+              </div>
+
+              {/* Date Collected and Name (optional) remain as before */}
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Date Collected</label>
+                <input
+                  {...register('dateCollected')}
+                  type="date"
+                  defaultValue={new Date().toISOString().split('T')[0]}
+                  max={new Date().toISOString().split('T')[0]}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                />
+                {errors.dateCollected && (
+                  <p className="mt-1 text-red-500 text-xs">{errors.dateCollected.message}</p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <label className="block font-mono text-sm text-[#2C3E50]">Name (optional)</label>
+                <input
+                  {...register('authorName')}
+                  className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm bg-transparent focus:outline-none"
+                  placeholder="Enter your name"
+                />
+              </div>
+            </div>
+
+            {/* Hidden hex input */}
+            <input type="hidden" {...register('hex')} />
+            {errors.hex && (
+              <p className="mt-1 text-red-500 text-xs">{errors.hex.message}</p>
+            )}
+            
+            {/* Hidden coordinates input */}
+            <input type="hidden" {...register('coordinates')} />
+            {errors.coordinates && (
+              <p className="mt-1 text-red-500 text-xs">{errors.coordinates.message}</p>
+            )}
+              <div className="space-y-6 mb-6">
+                {/* Upload Sections */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  {/* Outcome Image Upload */}
+                  <div>
+                    <div className="mb-2">
+                      <span className="font-mono text-sm text-[#2C3E50]">Color Outcome</span>
+                    </div>
+                    <div className="h-72">
+                    {mediaFiles.find(m => m.type === 'outcome') ? (
+                      <div className="relative w-full h-full border-2 border-[#2C3E50]">
+                        <Image
+                          src={mediaFiles.find(m => m.type === 'outcome')?.preview || ''}
+                          alt="Color outcome preview"
+                          fill
+                          className="object-cover"
+                        />
+                        <div className="absolute top-2 right-2 flex gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleCropImage('outcome')}
+                            className="p-1 bg-white rounded-full shadow-lg z-10 hover:bg-gray-50"
+                            title="Crop image"
+                          >
+                            <Crop className="w-4 h-4 text-[#2C3E50]" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveFile(mediaFiles.findIndex(m => m.type === 'outcome'))}
+                            className="p-1 bg-white rounded-full shadow-lg z-10 hover:bg-gray-50"
+                            title="Remove image"
+                          >
+                            <X className="w-4 h-4 text-[#2C3E50]" />
+                          </button>
+                        </div>
+                        {mediaFiles.find(m => m.type === 'outcome')?.caption && (
+                          <div className="absolute bottom-2 left-2 right-2 bg-white/90 p-2 rounded text-xs font-mono">
+                            Hex: {mediaFiles.find(m => m.type === 'outcome')?.caption}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <DragDropUpload
+                        onFilesSelected={(files) => handleFileUpload(files, 'outcome')}
+                        multiple={false}
+                        className="w-full h-full"
+                      >
+                        <div className="flex flex-col items-center justify-center h-full">
+                          <Upload className="w-8 h-8 text-[#2C3E50] mb-2" />
+                          <p className="text-sm text-[#2C3E50]">Upload outcome image</p>
+                          <p className="text-xs text-gray-500 mt-1">Crop the relevant area to generate the hex color</p>
+                        </div>
+                      </DragDropUpload>
+                    )}
+                  </div>
+                </div>
+
+                  {/* Landscape Image Upload */}
+                  <div>
+                    <div className="mb-2">
+                      <span className="font-mono text-sm text-[#2C3E50]">Landscape Photo</span>
+                    </div>
+                    <div className="h-72">
+                    {mediaFiles.find(m => m.type === 'landscape') ? (
+                      <div className="relative w-full h-full border-2 border-[#2C3E50]">
+                        <Image
+                          src={mediaFiles.find(m => m.type === 'landscape')?.preview || ''}
+                          alt="Landscape preview"
+                          fill
+                          className="object-cover"
+                        />
+                        <div className="absolute top-2 right-2 flex gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleCropImage('landscape')}
+                            className="p-1 bg-white rounded-full shadow-lg z-10 hover:bg-gray-50"
+                            title="Crop image"
+                          >
+                            <Crop className="w-4 h-4 text-[#2C3E50]" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveFile(mediaFiles.findIndex(m => m.type === 'landscape'))}
+                            className="p-1 bg-white rounded-full shadow-lg z-10 hover:bg-gray-50"
+                            title="Remove image"
+                          >
+                            <X className="w-4 h-4 text-[#2C3E50]" />
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <DragDropUpload
+                        onFilesSelected={(files) => handleFileUpload(files, 'landscape')}
+                        multiple={false}
+                        className="w-full h-full"
+                      >
+                                              <div className="flex flex-col items-center justify-center h-full">
+                        <Upload className="w-8 h-8 text-[#2C3E50] mb-2" />
+                        <p className="text-sm text-[#2C3E50]">Landscape photo</p>
+                        <p className="text-xs text-gray-500 mt-1">Upload landscape photo where the material comes
+                        
+
+                        </p>
+                      </div>
+                      </DragDropUpload>
+                    )}
+                  </div>
+                </div>
+
+                  {/* Media Images Upload */}
+                  <div>
+                    <div className="mb-2">
+                      <span className="font-mono text-sm text-[#2C3E50]">Media Images</span>
+                    </div>
+                    <div className="h-72">
+                    <DragDropUpload
+                      onFilesSelected={(files) => handleFileUpload(files, 'process')}
+                      multiple={true}
+                      maxFiles={20}
+                      className="w-full h-full"
+                    >
+                      <div className="flex flex-col items-center justify-center h-full">
+                        <Upload className="w-8 h-8 text-[#2C3E50] mb-2" />
+                        <p className="text-sm text-[#2C3E50]">Add Media Photos</p>
+                        <p className="text-xs text-gray-500 mt-1">Upload additional media photos</p>
+                      </div>
+                    </DragDropUpload>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Media Images Gallery */}
+              {mediaFiles.filter(m => m.type === 'process').length > 0 && (
+                <div className="space-y-4 mb-6">
+                  <h3 className="font-mono text-sm text-[#2C3E50]">Uploaded Media Photos:</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {mediaFiles
+                      .filter(m => m.type === 'process')
+                      .map((media, index) => {
+                        // Find the actual index in the full mediaFiles array
+                        const actualIndex = mediaFiles.findIndex(m => m === media);
+                        return (
+                          <div key={actualIndex} className="space-y-3">
+                            <div className="relative aspect-square border-2 border-[#2C3E50] rounded">
+                              <Image
+                                src={media.preview}
+                                alt={`Media image ${index + 1}`}
+                                fill
+                                className="object-cover rounded"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveFile(actualIndex)}
+                                className="absolute top-2 right-2 p-1 bg-white rounded-full shadow-lg hover:bg-gray-100"
+                              >
+                                <X className="w-4 h-4 text-[#2C3E50]" />
+                              </button>
+                            </div>
+                            <textarea
+                              placeholder="Add caption..."
+                              value={media.caption}
+                              onChange={(e) => handleCaptionChange(actualIndex, e.target.value)}
+                              className="w-full p-3 border-2 border-[#2C3E50] font-mono text-sm resize-none focus:outline-none rounded"
+                              rows={3}
+                            />
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              )}
+              </div>
+            </div>
+
+            {/* Submit button */}
+            <div className="flex justify-center mt-4 pt-4 border-t border-gray-200">
+              <button
+                type="submit"
+                disabled={submitting}
+                className="bos-button text-lg px-6 py-2"
+                style={{ fontSize: '1.125rem' }}
+              >
+                {submitting ? 'Submitting...' : 'Submit Color'}
+              </button>
+            </div>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+      
+      {/* Image Cropper Modal */}
+      <Dialog.Root open={showCropper} onOpenChange={(open) => { if (!open) handleCropCancel(); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/80 z-[200]" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 max-w-full w-[90vw] max-w-lg z-[201] bg-white rounded-lg shadow-lg p-0">
+            <Dialog.Title className="sr-only">Crop & Adjust Image</Dialog.Title>
+            <ImageCropper
+              imageSrc={cropperImage}
+              onCrop={handleCropComplete}
+              onCancel={handleCropCancel}
+              aspectRatio={1}
+            />
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </Dialog.Root>
+  );
+}
