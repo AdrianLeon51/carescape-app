@@ -56,7 +56,8 @@ export default function SustainabilityAnalysis({
 
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({
-          model: 'models/gemini-2.0-flash-exp',
+          //model: 'models/gemini-2.0-flash-exp',
+          model: 'models/gemini-2.5-flash',
           generationConfig: {
             temperature: 0.5,
             maxOutputTokens: 400,
